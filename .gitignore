@@ -1,0 +1,11 @@
+# Build output
+*.exe
+*.res
+*.obj
+*.pdb
+
+# Runtime log
+*.log
+
+# Previews written by make_icon.ps1
+icon_preview*.png
