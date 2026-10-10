@@ -18,8 +18,7 @@ It uses Claude's own dictation; it just presses the button for you.
 
 This project was built with [Claude Code](https://claude.com/claude-code) as an experiment in
 AI-assisted development. I came up with the idea and the behaviour, tested each step against the
-real app and kept iterating on it; Claude wrote the code. Commits written with Claude are marked
-with a `Co-Authored-By` line.
+real app and kept iterating on it; Claude wrote the code.
 
 ## Build
 
