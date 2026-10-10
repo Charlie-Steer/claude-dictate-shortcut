@@ -8,7 +8,8 @@
  *   - Code tab              -> toggles "Press and hold to record" / "Stop dictation"
  *
  * Runs in the background with a tray icon: click = same as the shortcut,
- * right-click -> Change shortcut / Exit.
+ * right-click -> Change shortcut / Run with Claude / Exit.
+ * "Run with Claude" starts it with Windows, dormant until claude.exe runs.
  * The shortcut is saved in HKCU\Software\ClaudeDictate.
  * Log file: claude_dictate.log next to the exe.
  *
@@ -45,7 +46,9 @@ int WINAPI GdipFillPath(void *g, void *brush, void *path);
 #define GP_UNIT_PIXEL       2
 
 /* ---- Names as exposed by the Claude app. An app update may rename these. ---- */
+#ifndef PROCESS_EXE
 #define PROCESS_EXE        L"claude.exe"
+#endif
 #define BTN_DICTATE        L"Dictate"
 #define BTN_FINISH         L"Finish dictation"
 #define BTN_CANCEL         L"Cancel dictation"
@@ -65,13 +68,19 @@ int WINAPI GdipFillPath(void *g, void *brush, void *path);
 #define MASK_VK            0xE8  /* unassigned key, injected so a lone Win/Alt
                                     release doesn't open Start or a menu bar */
 
+#define WATCH_MS           2000  /* "Run with Claude": check for claude.exe */
+#define RUN_KEY            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VALUE          L"ClaudeDictate"
+
 #define POLL_TIMER_ID      1
+#define WATCH_TIMER_ID     2
 #define WM_TRAY            (WM_APP + 1)
 #define WM_SHORTCUT_HIT    (WM_APP + 2)  /* hook thread -> main window */
 #define WM_DLG_MODS        (WM_APP + 3)  /* hook thread -> shortcut window */
 #define WM_DLG_KEY         (WM_APP + 4)
 #define IDM_EXIT           100
 #define IDM_SHORTCUT       101
+#define IDM_WITH_CLAUDE    102
 #define IDC_SAVE           201
 #define IDC_CANCEL         202
 #define IDC_RESET          203
@@ -93,6 +102,7 @@ static HWND g_main;                       /* hidden window that receives the sho
 static volatile UINT g_hk_mods = DEFAULT_MODS;   /* current shortcut (read by hook thread) */
 static volatile UINT g_hk_vk = DEFAULT_VK;
 static HWND volatile g_dlg;               /* "Change shortcut" window, if open */
+static volatile BOOL g_active = TRUE;     /* shortcut live (FALSE while waiting for Claude) */
 
 static void logf_(const char *fmt, ...)
 {
@@ -419,7 +429,7 @@ static LRESULT CALLBACK kb_hook(int code, WPARAM wp, LPARAM lp)
             if (hook_dialog(dlg, vk, down)) return 1;
         } else if (down) {
             if (vk == s_down) return 1;               /* auto-repeat */
-            if (vk == g_hk_vk && !mod_of_vk(vk) && held_mods() == g_hk_mods) {
+            if (g_active && vk == g_hk_vk && !mod_of_vk(vk) && held_mods() == g_hk_mods) {
                 s_down = vk;
                 if (g_hk_mods & (MOD_WIN | MOD_ALT)) send_mask_key();
                 PostMessageW(g_main, WM_SHORTCUT_HIT, 0, 0);
@@ -488,6 +498,64 @@ static void warm_up(void)
         IUIAutomationElement_Release(root);
     }
     logf_("warm-up: %d Claude window(s)", wl.count);
+}
+
+/* ---------------- "Run with Claude" ----------------
+ * When on, the program starts with Windows (HKCU Run key) and stays dormant:
+ * no tray icon and no shortcut until claude.exe is running, and back to
+ * dormant when it exits. */
+
+static BOOL g_with_claude;
+static BOOL g_tray_shown;
+
+/* "Claude is open" = a visible window owned by claude.exe (the same windows
+   the buttons are searched in). A process alone isn't enough: the Claude Code
+   CLI is also claude.exe but has no window or dictation buttons. */
+static BOOL claude_running(void)
+{
+    WindowList wl = {0};
+    EnumWindows(enum_proc, (LPARAM)&wl);
+    return wl.count > 0;
+}
+
+static void show_tray(BOOL show)
+{
+    if (show == g_tray_shown) return;
+    g_tray_shown = show;
+    Shell_NotifyIconW(show ? NIM_ADD : NIM_DELETE, &g_nid);
+}
+
+/* Show the icon and enable the shortcut only while Claude runs (or always,
+   when "Run with Claude" is off). */
+static void sync_with_claude(HWND hwnd)
+{
+    BOOL active = !g_with_claude || claude_running();
+    if (active == g_active && active == g_tray_shown) return;
+    g_active = active;
+    if (!active) set_recording(hwnd, FALSE);
+    show_tray(active);
+    logf_(active ? "active (Claude running)" : "dormant (waiting for Claude)");
+    if (active && g_with_claude) warm_up();
+}
+
+static void set_run_with_claude(HWND hwnd, BOOL on)
+{
+    g_with_claude = on;
+    DWORD v = on;
+    RegSetKeyValueW(HKEY_CURRENT_USER, REG_KEY, L"RunWithClaude", REG_DWORD, &v, sizeof v);
+    if (on) {
+        /* (Re)write the current exe path, so moving the exe and starting it once fixes it. */
+        wchar_t path[MAX_PATH], cmd[MAX_PATH + 2];
+        GetModuleFileNameW(NULL, path, MAX_PATH);
+        swprintf(cmd, MAX_PATH + 2, L"\"%ls\"", path);
+        RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ, cmd,
+                        (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
+        SetTimer(hwnd, WATCH_TIMER_ID, WATCH_MS, NULL);
+    } else {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+        KillTimer(hwnd, WATCH_TIMER_ID);
+    }
+    sync_with_claude(hwnd);
 }
 
 /* ---------------- "Change shortcut" window ---------------- */
@@ -795,10 +863,18 @@ static void open_shortcut_dialog(HINSTANCE inst)
 
 /* ---------------- Window / tray ---------------- */
 
+static UINT g_msg_taskbar_created;
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == g_msg_taskbar_created && msg) {
+        /* Explorer restarted: the tray icon is gone, add it again. */
+        if (g_tray_shown) Shell_NotifyIconW(NIM_ADD, &g_nid);
+        return 0;
+    }
     switch (msg) {
     case WM_SHORTCUT_HIT: {
+        if (!g_active) return 0;   /* dormant: never press anything */
         int pressed = on_hotkey();
         if (pressed >= 0) set_recording(hwnd, pressed >= N_STOP_BUTTONS);
         /* Drop presses that queued up while we were busy. */
@@ -813,6 +889,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (is_recording()) g_misses = 0;
             else if (++g_misses >= POLL_MISSES) set_recording(hwnd, FALSE);
         }
+        if (wp == WATCH_TIMER_ID) sync_with_claude(hwnd);
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
@@ -824,6 +901,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING | MF_GRAYED, 0, label);
             AppendMenuW(m, MF_STRING, IDM_SHORTCUT, L"Change shortcut...");
+            AppendMenuW(m, MF_STRING | (g_with_claude ? MF_CHECKED : 0), IDM_WITH_CLAUDE,
+                        L"Run with Claude");
             AppendMenuW(m, MF_SEPARATOR, 0, NULL);
             AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
             SetForegroundWindow(hwnd);
@@ -837,15 +916,38 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == IDM_SHORTCUT) open_shortcut_dialog(GetModuleHandleW(NULL));
+        if (LOWORD(wp) == IDM_WITH_CLAUDE) set_run_with_claude(hwnd, !g_with_claude);
         if (LOWORD(wp) == IDM_EXIT) DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         if (g_dlg) DestroyWindow(g_dlg);
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        show_tray(FALSE);
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Dark popup menus (the tray menu). Windows has no documented API for this;
+   uxtheme.dll's SetPreferredAppMode (ordinal 135, Windows 10 1903+) is what
+   Explorer, Notepad++ and others use. If anything is missing, menus stay light. */
+static void enable_dark_menus(void)
+{
+    typedef LONG (WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);
+    typedef int (WINAPI *SetPreferredAppModeFn)(int);
+    typedef void (WINAPI *FlushMenuThemesFn)(void);
+
+    OSVERSIONINFOW ver = {0};
+    ver.dwOSVersionInfoSize = sizeof ver;
+    RtlGetVersionFn get_ver = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (!get_ver || get_ver(&ver) != 0 || ver.dwBuildNumber < 18362) return;
+
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    SetPreferredAppModeFn set_mode = (SetPreferredAppModeFn)(void *)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+    FlushMenuThemesFn flush = (FlushMenuThemesFn)(void *)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    if (set_mode) set_mode(2);   /* ForceDark */
+    if (flush) flush();
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
@@ -860,6 +962,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     }
 
     open_log();
+    enable_dark_menus();
     ULONG_PTR gdip_token;
     GdiplusStartupInput gdip_in = {1, NULL, FALSE, FALSE};
     GdiplusStartup(&gdip_token, &gdip_in, NULL);
@@ -875,9 +978,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hInstance = inst;
     wc.lpszClassName = L"ClaudeDictateWnd";
     RegisterClassW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"Claude Dictate", 0, 0, 0, 0, 0,
-                              HWND_MESSAGE, NULL, inst, NULL);
+    /* A hidden top-level window (not message-only), so it receives the
+       TaskbarCreated broadcast. */
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Claude Dictate", WS_POPUP,
+                                0, 0, 0, 0, NULL, NULL, inst, NULL);
     g_main = hwnd;
+    g_msg_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     load_shortcut();
     wchar_t combo[64];
     format_combo(g_hk_mods, g_hk_vk, combo, 64);
@@ -895,12 +1001,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     if (!g_icon_rec) g_icon_rec = g_icon_idle;
     g_nid.hIcon = g_icon_idle;
     update_tray_tip();
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     DWORD hook_tid;
     HANDLE hook = CreateThread(NULL, 0, hook_thread, NULL, 0, &hook_tid);
     logf_("started, shortcut %ls", combo);
-    warm_up();
+
+    DWORD with_claude = 0, size = sizeof with_claude;
+    RegGetValueW(HKEY_CURRENT_USER, REG_KEY, L"RunWithClaude", RRF_RT_REG_DWORD, NULL, &with_claude, &size);
+    if (with_claude) {
+        set_run_with_claude(hwnd, TRUE);   /* shows the icon only if Claude is running */
+    } else {
+        show_tray(TRUE);
+        warm_up();
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

@@ -9,6 +9,7 @@ It uses Claude's own dictation; it just presses the button for you.
 - Tray icon turns **red while recording**. Click it to start/stop, right-click for options.
 - **Change the shortcut** from the tray menu: press any combination and it's shown as keycaps.
   Combinations Windows already uses (like Win+J) can be taken over.
+- Optional **Run with Claude**: the tray icon and shortcut appear when Claude opens and go away when it closes.
 - Single small `.exe`, no runtime or installer. Written in plain C against the Win32 API.
 
 ![Change shortcut window](docs/shortcut-window.png)
@@ -47,8 +48,11 @@ developer prompt is needed) and produces `ClaudeDictate.exe`.
 3. Right-click the tray icon → **Change shortcut…** to pick a different shortcut. In that window,
    Enter saves and Esc cancels. The shortcut is stored in `HKCU\Software\ClaudeDictate`.
 
-To start it with Windows, put a shortcut to `ClaudeDictate.exe` in the Startup folder
-(press Win+R and type `shell:startup`).
+4. Right-click → **Run with Claude** to have it follow Claude: it starts silently when you log in,
+   and the tray icon and shortcut are only there while Claude is running (it checks every 2 s).
+   This adds a `ClaudeDictate` entry to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`;
+   unchecking the option removes it. If you move the exe, start it once from the new location
+   to update the entry.
 
 A log of what each press did is written to `claude_dictate.log` next to the exe.
 
@@ -67,6 +71,9 @@ A log of what each press did is written to `claude_dictate.log` next to the exe.
   take over combinations Windows reserves. The hook runs on its own thread so the keyboard never waits
   on UI Automation calls. When the shortcut uses Win or Alt, an unassigned key is injected so
   releasing Win doesn't open the Start menu.
+- **Run with Claude:** Windows has no "start when another program starts" trigger, so the program
+  starts at login and stays dormant (no tray icon, shortcut passed through to Windows) until
+  `claude.exe` appears in the process list.
 - **Recording indicator:** while the icon is red, the program checks twice a second whether a
   stop button is still present, so it notices when dictation ends some other way.
 
@@ -86,4 +93,3 @@ A log of what each press did is written to `claude_dictate.log` next to the exe.
 | `build.cmd` | Build script |
 | `claude_dictate.rc`, `*.ico` | Tray icons (idle / recording) embedded in the exe |
 | `make_icon.ps1` | Regenerates the icons |
-| `PLAN.txt` | The original plan this was built from |
